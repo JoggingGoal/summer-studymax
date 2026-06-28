@@ -1170,15 +1170,21 @@ function DayDetail({ date, group, me, viewMember, persistGroup, showToast, start
 
       <TimelapseList group={group} date={date} memberId={viewMember.id} activities={activities} me={me} isMe={isMe} persistGroup={persistGroup} showToast={showToast} />
 
-      {isMe && result.status === STATUS.MISSED && (
+      {isMe && !result.exemption && (
         <div className="day-actions">
-          <button className="action-btn" onClick={() => setShowExemptForm(s => !s)}>
-            <AlertCircle size={14} /> Request exemption
-          </button>
+          {date === dateStrToday() ? (
+            <p className="muted-note small">
+              Exemptions must be requested by the day before — you can't request one for today.
+            </p>
+          ) : (
+            <button className="action-btn" onClick={() => setShowExemptForm(s => !s)}>
+              <AlertCircle size={14} /> Request exemption
+            </button>
+          )}
         </div>
       )}
 
-      {showExemptForm && (
+      {showExemptForm && date !== dateStrToday() && (
         <ExemptionRequestForm
           date={date} me={me} group={group} persistGroup={persistGroup} showToast={showToast}
           onDone={() => setShowExemptForm(false)}
@@ -1255,6 +1261,10 @@ function ExemptionRequestForm({ date, me, group, persistGroup, showToast, onDone
   const [busy, setBusy] = useState(false);
 
   async function submit() {
+    if (date === dateStrToday()) {
+      showToast("Exemptions must be requested by the day before", "error");
+      return;
+    }
     if (!reason.trim()) {
       showToast("Add a short reason", "error");
       return;
