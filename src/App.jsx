@@ -543,8 +543,7 @@ function Onboarding({ onCreate, onJoin }) {
           <RuleLine icon={Flame} text="Miss the deadline → 1 point. Most points at the end loses." />
           <RuleLine icon={ThumbsUp} text="Exemptions & timelapse proof are decided by group vote" />
         </div>
-		<div className="onboard-hero">
-		  <Flame size={12} color="var(--c-amber)" />
+		<div>
 		  <p>Created by Aryan and Claude 67</p>
 		</div>
       </div>
