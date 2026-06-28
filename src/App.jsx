@@ -541,10 +541,8 @@ function Onboarding({ onCreate, onJoin }) {
         <div className="onboard-rules">
           <RuleLine icon={Clock} text="Set your own hours-per-day and deadline once you create or join a group" />
           <RuleLine icon={Flame} text="Miss the deadline → 1 point. Most points at the end loses." />
-          <RuleLine icon={ThumbsUp} text="Exemptions & timelapse proof are decided by group vote" />
-			<RuleLine icon={ThumbsUp} text="Created by Aryan and Claude 67" />
-        </div>
-		
+          <RuleLine icon={ThumbsUp} text="Exemptions & timelapse proof are decided by group vote-Aryan" />
+        </div>	
       </div>
     );
   }
