@@ -8,7 +8,7 @@ import { supabase } from "./supabaseClient.js";
 
 /* ============================================================
    CONSTANTS — these are now DEFAULTS only. Each group stores its own
-   copy in group.settings, which any member can edit from Group > Settings.
+   copy in group.settings, which only admins can edit from Settings.
 ============================================================ */
 const DEFAULT_SETTINGS = {
   weekdayHours: 4,
@@ -20,6 +20,30 @@ const DEFAULT_SETTINGS = {
 
 function getSettings(group) {
   return { ...DEFAULT_SETTINGS, ...(group.settings || {}) };
+}
+
+/* ============================================================
+   ADMIN HELPERS
+   The member who creates a group is admin by default. Admins can
+   promote/demote other members. A group can never end up with zero
+   admins — demoting the last admin is blocked in the UI.
+   For groups created before admin roles existed (no member has
+   isAdmin: true), the earliest-joined member is treated as admin
+   automatically so nobody gets locked out of settings.
+============================================================ */
+function isAdmin(group, memberId) {
+  const member = group.members.find(m => m.id === memberId);
+  if (!member) return false;
+  if (member.isAdmin) return true;
+  const anyAdmin = group.members.some(m => m.isAdmin);
+  if (anyAdmin) return false;
+  // legacy fallback: no admins set yet, earliest joiner counts as admin
+  const earliest = [...group.members].sort((a, b) => a.joinedAt - b.joinedAt)[0];
+  return earliest && earliest.id === memberId;
+}
+
+function adminCount(group) {
+  return group.members.filter(m => isAdmin(group, m.id)).length;
 }
 
 const STATUS = {
@@ -184,12 +208,15 @@ function genId() {
    GROUP DATA SHAPE (stored under groups:<code>)
    {
      code, name, createdAt, startDate, forfeit,
-     members: [{id, name, joinedAt}],
-     logs: { [dateStr]: { [memberId]: { hours, note } } },
+     members: [{id, name, joinedAt, isAdmin}],
+     // each day's log holds a list of separate activities per member —
+     // e.g. "Calc homework: 2h" + "Reading: 1.5h" — the day's total is
+     // the sum of all activity hours
+     logs: { [dateStr]: { [memberId]: { activities: [{id, label, hours}], note } } },
      exemptionRequests: [{id, memberId, date, type:'full'|'partial', partialHours, reason, votes:{memberId:'yes'|'no'}, status:'open'|'granted'|'denied', createdAt}],
-     // a member can submit multiple timelapse clips for the same day — each is its own
-     // entry here with its own independent vote
-     timelapseVotes: [{id, memberId, date, url, label, votes:{memberId:'yes'|'no'}, status:'open'|'counted'|'rejected', createdAt}]
+     // a timelapse is tied to ONE activity, not the whole day — a member
+     // can submit a separate clip per activity, each with its own vote
+     timelapseVotes: [{id, memberId, date, activityId, activityLabel, url, label, votes:{memberId:'yes'|'no'}, status:'open'|'counted'|'rejected', createdAt}]
    }
 ============================================================ */
 
@@ -202,6 +229,10 @@ function tallyVotes(votesObj, totalOtherMembers, voteThreshold = "majority") {
   return { yes, no, needed, passed: yes >= needed && totalOtherMembers > 0 };
 }
 
+function activitiesTotalHours(activities) {
+  return (activities || []).reduce((sum, a) => sum + (parseFloat(a.hours) || 0), 0);
+}
+
 /* ============================================================
    DAY STATUS COMPUTATION
 ============================================================ */
@@ -210,7 +241,7 @@ function computeDayStatus(group, dateStr, memberId) {
   if (dateStr > dateStrToday()) return { status: STATUS.FUTURE, hoursLogged: 0, required: requiredHours(dateStr, settings) };
   const required = requiredHours(dateStr, settings);
   const log = group.logs?.[dateStr]?.[memberId];
-  const hoursLogged = log?.hours || 0;
+  const hoursLogged = activitiesTotalHours(log?.activities);
 
   // exemption?
   const exemption = (group.exemptionRequests || []).find(
@@ -265,7 +296,8 @@ const STATUS_STYLE = {
 ============================================================ */
 export default function App() {
   const [booting, setBooting] = useState(true);
-  const [identity, setIdentity] = useState(null); // {memberId, name, groupCode}
+  const [memberships, setMemberships] = useState([]); // [{memberId, name, groupCode, groupName}]
+  const [activeCode, setActiveCode] = useState(null); // which group is currently open, or null = home screen
   const [group, setGroup] = useState(null);
   const [tab, setTab] = useState("calendar");
   const [toast, setToast] = useState(null);
@@ -276,25 +308,25 @@ export default function App() {
     setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), 3200);
   }, []);
 
-  // boot: load personal identity from this device, then fetch the group once
+  const identity = activeCode ? memberships.find(m => m.groupCode === activeCode) : null;
+
+  // boot: load saved memberships from this device. Doesn't auto-open a
+  // group — the person picks one (or creates/joins a new one) from home.
   useEffect(() => {
-    (async () => {
-      const saved = loadPersonal("identity", null);
-      if (saved) {
-        setIdentity(saved);
-        const g = await loadGroup(saved.groupCode);
-        setGroup(g);
-      }
-      setBooting(false);
-    })();
+    const saved = loadPersonal("memberships", []);
+    setMemberships(saved);
+    setBooting(false);
   }, []);
 
-  // subscribe to live updates for this group via Supabase Realtime, so
-  // every friend's screen updates the moment anyone saves a change —
-  // no polling needed. Falls back to a 5s safety poll in case a realtime
-  // event is ever missed (e.g. brief network drop).
+  // subscribe to live updates for the currently open group via Supabase
+  // Realtime, so every friend's screen updates the moment anyone saves a
+  // change — no polling needed. Falls back to a safety poll in case a
+  // realtime event is ever missed (e.g. brief network drop).
   useEffect(() => {
-    if (!identity) return;
+    if (!identity) {
+      setGroup(null);
+      return;
+    }
 
     async function refresh() {
       const g = await loadGroup(identity.groupCode);
@@ -320,7 +352,7 @@ export default function App() {
       supabase.removeChannel(channel);
       clearInterval(safetyPoll);
     };
-  }, [identity]);
+  }, [identity?.groupCode]);
 
   const persistGroup = useCallback(async (updater) => {
     if (!identity) return;
@@ -332,13 +364,21 @@ export default function App() {
     return next;
   }, [identity, group]);
 
+  function addMembership(newMembership) {
+    setMemberships(prev => {
+      const next = [...prev.filter(m => m.groupCode !== newMembership.groupCode), newMembership];
+      savePersonal("memberships", next);
+      return next;
+    });
+  }
+
   async function handleCreateGroup({ groupName, yourName, startDate, forfeit }) {
     const code = genCode();
     const memberId = genId();
     const newGroup = {
       code, name: groupName, createdAt: Date.now(),
       startDate, forfeit: forfeit || "",
-      members: [{ id: memberId, name: yourName, joinedAt: Date.now() }],
+      members: [{ id: memberId, name: yourName, joinedAt: Date.now(), isAdmin: true }],
       logs: {}, exemptionRequests: [], timelapseVotes: [],
     };
     const ok = await saveGroup(code, newGroup);
@@ -346,10 +386,10 @@ export default function App() {
       showToast("Couldn't create the group — check your connection and try again", "error");
       return;
     }
-    const id = { memberId, name: yourName, groupCode: code };
-    savePersonal("identity", id);
-    setIdentity(id);
+    addMembership({ memberId, name: yourName, groupCode: code, groupName });
     setGroup(newGroup);
+    setActiveCode(code);
+    setTab("calendar");
     showToast(`Group "${groupName}" created — code ${code}`, "success");
   }
 
@@ -360,29 +400,56 @@ export default function App() {
       showToast("No group found with that code", "error");
       return false;
     }
+    const alreadyIn = memberships.find(m => m.groupCode === upperCode);
+    if (alreadyIn) {
+      setActiveCode(upperCode);
+      setGroup(existing);
+      setTab("calendar");
+      showToast(`Back in "${existing.name}"`, "success");
+      return true;
+    }
     const memberId = genId();
     const next = {
       ...existing,
-      members: [...existing.members, { id: memberId, name: yourName, joinedAt: Date.now() }],
+      members: [...existing.members, { id: memberId, name: yourName, joinedAt: Date.now(), isAdmin: false }],
     };
     const ok = await saveGroup(upperCode, next);
     if (!ok) {
       showToast("Couldn't join the group — check your connection and try again", "error");
       return false;
     }
-    const id = { memberId, name: yourName, groupCode: upperCode };
-    savePersonal("identity", id);
-    setIdentity(id);
+    addMembership({ memberId, name: yourName, groupCode: upperCode, groupName: existing.name });
     setGroup(next);
+    setActiveCode(upperCode);
+    setTab("calendar");
     showToast(`Joined "${existing.name}"`, "success");
     return true;
   }
 
-  function handleLeave() {
-    savePersonal("identity", null);
-    setIdentity(null);
-    setGroup(null);
+  function handleOpenGroup(membership) {
+    setActiveCode(membership.groupCode);
     setTab("calendar");
+  }
+
+  // Returning to home does NOT forget the group — it stays in "your groups"
+  // on the home screen so you can reopen it anytime with one tap.
+  function handleGoHome() {
+    setActiveCode(null);
+    setGroup(null);
+  }
+
+  // Fully forgetting a group removes it from "your groups" on this device.
+  // Rejoining later would need the group code again.
+  function handleForgetGroup(groupCode) {
+    setMemberships(prev => {
+      const next = prev.filter(m => m.groupCode !== groupCode);
+      savePersonal("memberships", next);
+      return next;
+    });
+    if (activeCode === groupCode) {
+      setActiveCode(null);
+      setGroup(null);
+    }
   }
 
   if (booting) {
@@ -398,23 +465,34 @@ export default function App() {
   if (!identity || !group) {
     return (
       <Shell>
-        <Onboarding onCreate={handleCreateGroup} onJoin={handleJoinGroup} />
+        <Onboarding
+          memberships={memberships}
+          onOpenGroup={handleOpenGroup}
+          onForgetGroup={handleForgetGroup}
+          onCreate={handleCreateGroup}
+          onJoin={handleJoinGroup}
+        />
       </Shell>
     );
   }
 
   const me = group.members.find(m => m.id === identity.memberId);
+  const amAdmin = isAdmin(group, identity.memberId);
 
   return (
     <Shell>
-      <TopBar group={group} onLeave={handleLeave} showToast={showToast} />
+      <TopBar group={group} onLeave={handleGoHome} showToast={showToast} />
       <div className="screen">
         {tab === "calendar" && <CalendarTab group={group} me={me} persistGroup={persistGroup} showToast={showToast} />}
-        {tab === "group" && <GroupTab group={group} me={me} persistGroup={persistGroup} showToast={showToast} />}
+        {tab === "group" && <GroupTab group={group} me={me} amAdmin={amAdmin} persistGroup={persistGroup} showToast={showToast} />}
         {tab === "votes" && <VotesTab group={group} me={me} persistGroup={persistGroup} showToast={showToast} />}
         {tab === "standings" && <StandingsTab group={group} me={me} />}
       </div>
-      <TabBar tab={tab} setTab={setTab} pendingVotes={countOpenVotesRelevantToMe(group, me)} />
+      <TabBar
+        tab={tab} setTab={setTab}
+        pendingVotes={countOpenVotesRelevantToMe(group, me)}
+        amAdmin={amAdmin}
+      />
       {toast && <Toast toast={toast} />}
     </Shell>
   );
@@ -461,12 +539,12 @@ function TopBar({ group, onLeave, showToast }) {
         </button>
       </div>
       {!confirmLeave ? (
-        <button className="icon-btn" onClick={() => setConfirmLeave(true)} title="Leave group">
+        <button className="icon-btn" onClick={() => setConfirmLeave(true)} title="Back to home">
           <LogOut size={18} />
         </button>
       ) : (
         <div className="leave-confirm">
-          <span>Leave?</span>
+          <span>Go home?</span>
           <button className="mini-btn danger" onClick={onLeave}>Yes</button>
           <button className="mini-btn" onClick={() => setConfirmLeave(false)}>No</button>
         </div>
@@ -475,10 +553,10 @@ function TopBar({ group, onLeave, showToast }) {
   );
 }
 
-function TabBar({ tab, setTab, pendingVotes }) {
+function TabBar({ tab, setTab, pendingVotes, amAdmin }) {
   const items = [
     { id: "calendar", label: "Calendar", icon: CalIcon },
-    { id: "group", label: "Group", icon: Users },
+    { id: "group", label: amAdmin ? "Group" : "Group", icon: Users },
     { id: "votes", label: "Votes", icon: ThumbsUp, badge: pendingVotes },
     { id: "standings", label: "Standings", icon: Trophy },
   ];
@@ -513,7 +591,7 @@ function Toast({ toast }) {
 /* ============================================================
    ONBOARDING
 ============================================================ */
-function Onboarding({ onCreate, onJoin }) {
+function Onboarding({ memberships, onOpenGroup, onForgetGroup, onCreate, onJoin }) {
   const [mode, setMode] = useState("landing");
   const [groupName, setGroupName] = useState("");
   const [yourName, setYourName] = useState("");
@@ -532,6 +610,16 @@ function Onboarding({ onCreate, onJoin }) {
           <h1>Summer Study Pact</h1>
           <p>Log your hours. Keep the streak alive. Last place owes a forfeit.</p>
         </div>
+
+        {memberships.length > 0 && (
+          <div className="your-groups">
+            <span className="section-title" style={{ margin: "0 0 10px" }}>Your groups</span>
+            {memberships.map(m => (
+              <YourGroupRow key={m.groupCode} membership={m} onOpen={onOpenGroup} onForget={onForgetGroup} />
+            ))}
+          </div>
+        )}
+
         <button className="primary-btn" onClick={() => setMode("create")}>
           <Plus size={18} /> Start a new group
         </button>
@@ -541,8 +629,8 @@ function Onboarding({ onCreate, onJoin }) {
         <div className="onboard-rules">
           <RuleLine icon={Clock} text="Set your own hours-per-day and deadline once you create or join a group" />
           <RuleLine icon={Flame} text="Miss the deadline → 1 point. Most points at the end loses." />
-          <RuleLine icon={ThumbsUp} text="Exemptions & timelapse proof are decided by group vote-Aryan" />
-        </div>	
+          <RuleLine icon={ThumbsUp} text="Exemptions & timelapse proof are decided by group vote" />
+        </div>
       </div>
     );
   }
@@ -609,6 +697,29 @@ function Onboarding({ onCreate, onJoin }) {
       >
         {busy ? <Loader2 size={16} className="spin" /> : <Users size={16} />} Join group
       </button>
+    </div>
+  );
+}
+
+function YourGroupRow({ membership, onOpen, onForget }) {
+  const [confirmForget, setConfirmForget] = useState(false);
+  return (
+    <div className="your-group-row">
+      <button className="your-group-main" onClick={() => onOpen(membership)}>
+        <span className="member-avatar tiny">{(membership.groupName || "?").slice(0, 1).toUpperCase()}</span>
+        <span className="your-group-name">{membership.groupName}</span>
+        <span className="your-group-as">as {membership.name}</span>
+      </button>
+      {!confirmForget ? (
+        <button className="icon-btn" onClick={() => setConfirmForget(true)} title="Remove from this device">
+          <X size={16} />
+        </button>
+      ) : (
+        <div className="leave-confirm">
+          <button className="mini-btn danger" onClick={() => onForget(membership.groupCode)}>Remove</button>
+          <button className="mini-btn" onClick={() => setConfirmForget(false)}>No</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -905,42 +1016,73 @@ function DayDetail({ date, group, me, viewMember, persistGroup, showToast, start
   const isMe = viewMember.id === me.id;
   const result = computeDayStatus(group, date, viewMember.id);
   const style = STATUS_STYLE[result.status];
-  const [hoursInput, setHoursInput] = useState("");
-  const [noteInput, setNoteInput] = useState("");
   const [showExemptForm, setShowExemptForm] = useState(false);
-  const [showTimelapseForm, setShowTimelapseForm] = useState(false);
+  const [addingActivity, setAddingActivity] = useState(false);
+  const [activityLabel, setActivityLabel] = useState("");
+  const [activityHours, setActivityHours] = useState("");
   const [saving, setSaving] = useState(false);
 
   const existingLog = group.logs?.[date]?.[viewMember.id];
+  const activities = existingLog?.activities || [];
   const pastDeadline = isPastDeadline(date, getSettings(group));
   const beforeStart = date < startDate;
 
   useEffect(() => {
-    setHoursInput(existingLog?.hours ? String(existingLog.hours) : "");
-    setNoteInput(existingLog?.note || "");
+    setAddingActivity(false);
+    setActivityLabel("");
+    setActivityHours("");
     setShowExemptForm(false);
-    setShowTimelapseForm(false);
-  }, [date, viewMember.id, existingLog?.hours, existingLog?.note]);
+  }, [date, viewMember.id]);
 
-  async function saveLog() {
-    const hours = parseFloat(hoursInput);
-    if (isNaN(hours) || hours < 0) {
+  async function addActivity() {
+    const hours = parseFloat(activityHours);
+    if (!activityLabel.trim()) {
+      showToast("Give the activity a short name", "error");
+      return;
+    }
+    if (isNaN(hours) || hours <= 0) {
       showToast("Enter a valid number of hours", "error");
       return;
     }
     setSaving(true);
+    const newActivity = { id: genId(), label: activityLabel.trim(), hours };
     await persistGroup(g => ({
       ...g,
       logs: {
         ...g.logs,
         [date]: {
           ...(g.logs[date] || {}),
-          [me.id]: { ...(g.logs[date]?.[me.id] || {}), hours, note: noteInput, loggedAt: Date.now() },
+          [me.id]: {
+            ...(g.logs[date]?.[me.id] || {}),
+            activities: [...((g.logs[date]?.[me.id]?.activities) || []), newActivity],
+          },
         },
       },
     }));
     setSaving(false);
-    showToast("Hours logged");
+    setActivityLabel("");
+    setActivityHours("");
+    setAddingActivity(false);
+    showToast("Activity logged");
+  }
+
+  async function removeActivity(activityId) {
+    await persistGroup(g => ({
+      ...g,
+      logs: {
+        ...g.logs,
+        [date]: {
+          ...(g.logs[date] || {}),
+          [me.id]: {
+            ...(g.logs[date]?.[me.id] || {}),
+            activities: (g.logs[date]?.[me.id]?.activities || []).filter(a => a.id !== activityId),
+          },
+        },
+      },
+      // any timelapse votes tied to this activity become orphaned but harmless;
+      // they still show up labeled by their saved activityLabel
+    }));
+    showToast("Activity removed");
   }
 
   if (beforeStart) {
@@ -963,7 +1105,7 @@ function DayDetail({ date, group, me, viewMember, persistGroup, showToast, start
 
       <div className="day-detail-req">
         <Clock size={14} />
-        <span>{result.required}h required · due {fmtDeadline(getSettings(group))}{!isMe ? ` · viewing ${viewMember.name}` : ""}</span>
+        <span>{result.hoursLogged}h / {result.required}h required · due {fmtDeadline(getSettings(group))}{!isMe ? ` · viewing ${viewMember.name}` : ""}</span>
       </div>
 
       {result.exemption && (
@@ -973,41 +1115,65 @@ function DayDetail({ date, group, me, viewMember, persistGroup, showToast, start
         </div>
       )}
 
+      {activities.length > 0 && (
+        <div className="activity-list">
+          {activities.map(a => (
+            <div key={a.id} className="activity-row">
+              <span className="activity-label">{a.label}</span>
+              <span className="activity-hours">{a.hours}h</span>
+              {isMe && !pastDeadline && (
+                <button className="icon-btn small" onClick={() => removeActivity(a.id)} title="Remove">
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+          ))}
+          <div className="activity-row total">
+            <span className="activity-label">Total</span>
+            <span className="activity-hours">{activitiesTotalHours(activities)}h</span>
+          </div>
+        </div>
+      )}
+
       {isMe && !pastDeadline && (
-        <div className="log-form">
-          <Field label="Hours studied today">
-            <input
-              type="number" min="0" step="0.25" inputMode="decimal"
-              value={hoursInput} onChange={e => setHoursInput(e.target.value)}
-              placeholder="0"
-            />
-          </Field>
-          <Field label="Note (optional)">
-            <input value={noteInput} onChange={e => setNoteInput(e.target.value)} placeholder="What'd you study?" />
-          </Field>
-          <button className="primary-btn" onClick={saveLog} disabled={saving}>
-            {saving ? <Loader2 size={15} className="spin" /> : <Check size={15} />} Save hours
+        addingActivity ? (
+          <div className="sub-form">
+            <Field label="What did you study?">
+              <input value={activityLabel} onChange={e => setActivityLabel(e.target.value)} placeholder="e.g. Calc homework" autoFocus />
+            </Field>
+            <Field label="Hours">
+              <input
+                type="number" min="0" step="0.25" inputMode="decimal"
+                value={activityHours} onChange={e => setActivityHours(e.target.value)}
+                placeholder="0"
+              />
+            </Field>
+            <div className="form-row-btns">
+              <button className="primary-btn" onClick={addActivity} disabled={saving}>
+                {saving ? <Loader2 size={15} className="spin" /> : <Check size={15} />} Add
+              </button>
+              <button className="secondary-btn" onClick={() => { setAddingActivity(false); setActivityLabel(""); setActivityHours(""); }}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <button className="action-btn" onClick={() => setAddingActivity(true)}>
+            <Plus size={14} /> Add activity
           </button>
-        </div>
+        )
       )}
 
-      {isMe && pastDeadline && existingLog && (
-        <div className="logged-summary">
-          Logged {existingLog.hours}h{existingLog.note ? ` — "${existingLog.note}"` : ""}
-        </div>
+      {activities.length === 0 && !addingActivity && (
+        <p className="muted-note small">
+          {isMe ? "No activities logged yet today." : `${viewMember.name} hasn't logged anything yet today.`}
+        </p>
       )}
 
-      <TimelapseList group={group} date={date} memberId={viewMember.id} />
+      <TimelapseList group={group} date={date} memberId={viewMember.id} activities={activities} me={me} isMe={isMe} persistGroup={persistGroup} showToast={showToast} />
 
-      {isMe && (
+      {isMe && result.status === STATUS.MISSED && (
         <div className="day-actions">
-          {result.status === STATUS.MISSED && (
-            <button className="action-btn" onClick={() => setShowExemptForm(s => !s)}>
-              <AlertCircle size={14} /> Request exemption
-            </button>
-          )}
-          <button className="action-btn" onClick={() => setShowTimelapseForm(s => !s)}>
-            <Video size={14} /> Add timelapse
+          <button className="action-btn" onClick={() => setShowExemptForm(s => !s)}>
+            <AlertCircle size={14} /> Request exemption
           </button>
         </div>
       )}
@@ -1018,40 +1184,60 @@ function DayDetail({ date, group, me, viewMember, persistGroup, showToast, start
           onDone={() => setShowExemptForm(false)}
         />
       )}
-
-      {showTimelapseForm && (
-        <TimelapseSubmitForm
-          date={date} me={me} group={group} persistGroup={persistGroup} showToast={showToast}
-          onDone={() => setShowTimelapseForm(false)}
-        />
-      )}
     </div>
   );
 }
 
-function TimelapseList({ group, date, memberId }) {
+function TimelapseList({ group, date, memberId, activities, me, isMe, persistGroup, showToast }) {
   const votes = (group.timelapseVotes || [])
     .filter(v => v.memberId === memberId && v.date === date)
     .sort((a, b) => a.createdAt - b.createdAt);
-  if (votes.length === 0) return null;
   const total = group.members.length - 1;
   const threshold = getSettings(group).voteThreshold;
+  const pastDeadline = isPastDeadline(date, getSettings(group));
+  const [addingFor, setAddingFor] = useState(null); // activityId currently adding a clip for
+
+  if (activities.length === 0 && votes.length === 0) return null;
+
   return (
-    <div className="timelapse-list">
-      {votes.map((vote, i) => {
-        const tally = tallyVotes(vote.votes, total, threshold);
+    <div className="timelapse-section">
+      {activities.map(activity => {
+        const clips = votes.filter(v => v.activityId === activity.id);
         return (
-          <div className="timelapse-card" key={vote.id}>
-            <Video size={14} />
-            <div className="timelapse-card-body">
-              <a href={vote.url} target="_blank" rel="noopener noreferrer">
-                {vote.label || `Clip ${i + 1}`}
-              </a>
-              <span className={`tl-status ${vote.status}`}>
-                {vote.status === "open" ? `Voting: ${tally.yes} yes / ${tally.no} no (needs ${tally.needed})` :
-                 vote.status === "counted" ? "Counted as studying ✓" : "Group voted: doesn't count"}
-              </span>
+          <div key={activity.id} className="timelapse-activity-group">
+            <div className="timelapse-activity-head">
+              <Video size={13} />
+              <span>{activity.label}</span>
+              {isMe && !pastDeadline && addingFor !== activity.id && (
+                <button className="mini-btn" onClick={() => setAddingFor(activity.id)}>+ Clip</button>
+              )}
             </div>
+            {clips.length === 0 && addingFor !== activity.id && (
+              <p className="muted-note small" style={{ marginLeft: 21 }}>No timelapse submitted for this activity.</p>
+            )}
+            {clips.map(vote => {
+              const tally = tallyVotes(vote.votes, total, threshold);
+              return (
+                <div className="timelapse-card" key={vote.id}>
+                  <div className="timelapse-card-body">
+                    <a href={vote.url} target="_blank" rel="noopener noreferrer">
+                      {vote.label || "Watch clip"}
+                    </a>
+                    <span className={`tl-status ${vote.status}`}>
+                      {vote.status === "open" ? `Voting: ${tally.yes} yes / ${tally.no} no (needs ${tally.needed})` :
+                       vote.status === "counted" ? "Counted as studying ✓" : "Group voted: doesn't count"}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+            {addingFor === activity.id && (
+              <TimelapseSubmitForm
+                date={date} me={me} group={group} persistGroup={persistGroup} showToast={showToast}
+                activity={activity}
+                onDone={() => setAddingFor(null)}
+              />
+            )}
           </div>
         );
       })}
@@ -1112,9 +1298,9 @@ function ExemptionRequestForm({ date, me, group, persistGroup, showToast, onDone
 }
 
 /* ============================================================
-   TIMELAPSE SUBMIT FORM
+   TIMELAPSE SUBMIT FORM — always tied to one specific logged activity
 ============================================================ */
-function TimelapseSubmitForm({ date, me, group, persistGroup, showToast, onDone }) {
+function TimelapseSubmitForm({ date, me, group, persistGroup, showToast, activity, onDone }) {
   const [url, setUrl] = useState("");
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1131,7 +1317,9 @@ function TimelapseSubmitForm({ date, me, group, persistGroup, showToast, onDone 
         ...(g.timelapseVotes || []),
         {
           id: genId(), memberId: me.id, date, url: url.trim(),
-          label: label.trim(), votes: {}, status: "open", createdAt: Date.now(),
+          activityId: activity.id, activityLabel: activity.label,
+          label: label.trim() || `${activity.label} timelapse`,
+          votes: {}, status: "open", createdAt: Date.now(),
         },
       ],
     }));
@@ -1144,18 +1332,21 @@ function TimelapseSubmitForm({ date, me, group, persistGroup, showToast, onDone 
 
   return (
     <div className="sub-form">
-      <Field label="Timelapse link (Drive, YouTube, etc.)">
+      <Field label={`Timelapse link for "${activity.label}" (Drive, YouTube, etc.)`}>
         <input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://..." />
       </Field>
-      <Field label="Label (optional — e.g. 'morning session')">
-        <input value={label} onChange={e => setLabel(e.target.value)} placeholder="Morning session" />
+      <Field label="Label (optional)">
+        <input value={label} onChange={e => setLabel(e.target.value)} placeholder={`${activity.label} timelapse`} />
       </Field>
       <p className="muted-note small">
-        You can add more than one clip for the same day. Your group will watch each link and vote on whether it counts as real study time.
+        Your group will watch this clip and vote on whether it counts as real study time for this activity.
       </p>
-      <button className="primary-btn" onClick={submit} disabled={busy}>
-        {busy ? <Loader2 size={15} className="spin" /> : <Video size={15} />} Submit for vote
-      </button>
+      <div className="form-row-btns">
+        <button className="primary-btn" onClick={submit} disabled={busy}>
+          {busy ? <Loader2 size={15} className="spin" /> : <Video size={15} />} Submit for vote
+        </button>
+        <button className="secondary-btn" onClick={onDone}>Cancel</button>
+      </div>
     </div>
   );
 }
@@ -1163,16 +1354,18 @@ function TimelapseSubmitForm({ date, me, group, persistGroup, showToast, onDone 
 /* ============================================================
    GROUP TAB
 ============================================================ */
-function GroupTab({ group, me, persistGroup, showToast }) {
+function GroupTab({ group, me, amAdmin, persistGroup, showToast }) {
   const [editingForfeit, setEditingForfeit] = useState(false);
   const [forfeitText, setForfeitText] = useState(group.forfeit || "");
   const [editingSettings, setEditingSettings] = useState(false);
   const settings = getSettings(group);
   const [draft, setDraft] = useState(settings);
+  const admins = adminCount(group);
 
   const today = dateStrToday();
 
   function openSettingsEditor() {
+    if (!amAdmin) return;
     setDraft(getSettings(group));
     setEditingSettings(true);
   }
@@ -1188,6 +1381,24 @@ function GroupTab({ group, me, persistGroup, showToast }) {
     await persistGroup(g => ({ ...g, settings: clean }));
     setEditingSettings(false);
     showToast("Group settings updated for everyone");
+  }
+
+  async function toggleAdmin(memberId, makeAdmin) {
+    if (!amAdmin) return;
+    if (!makeAdmin) {
+      // blocked: can't demote the last admin
+      const current = adminCount(group);
+      const targetIsAdmin = isAdmin(group, memberId);
+      if (targetIsAdmin && current <= 1) {
+        showToast("Can't remove the last admin — promote someone else first", "error");
+        return;
+      }
+    }
+    await persistGroup(g => ({
+      ...g,
+      members: g.members.map(m => (m.id === memberId ? { ...m, isAdmin: makeAdmin } : m)),
+    }));
+    showToast(makeAdmin ? "Made admin" : "Removed admin");
   }
 
   return (
@@ -1207,24 +1418,41 @@ function GroupTab({ group, me, persistGroup, showToast }) {
       <div className="member-list">
         {group.members.map(m => {
           const points = totalPoints(group, m.id, group.startDate, today);
+          const memberIsAdmin = isAdmin(group, m.id);
           return (
-            <div key={m.id} className="member-row">
+            <div key={m.id} className="member-row admin-row">
               <span className="member-avatar">{m.name.slice(0, 1).toUpperCase()}</span>
-              <span className="member-name">{m.name}{m.id === me.id ? " (you)" : ""}</span>
+              <span className="member-name">
+                {m.name}{m.id === me.id ? " (you)" : ""}
+                {memberIsAdmin && <span className="admin-badge">Admin</span>}
+              </span>
               <span className="member-points">{points} pt{points === 1 ? "" : "s"}</span>
+              {amAdmin && m.id !== me.id && (
+                <button
+                  className="mini-btn"
+                  onClick={() => toggleAdmin(m.id, !memberIsAdmin)}
+                >
+                  {memberIsAdmin ? "Remove admin" : "Make admin"}
+                </button>
+              )}
             </div>
           );
         })}
       </div>
+      {!amAdmin && (
+        <p className="muted-note small" style={{ marginTop: 6 }}>
+          Only group admins can change settings or manage other admins.
+        </p>
+      )}
 
       <SectionTitle>Group settings</SectionTitle>
       {!editingSettings ? (
-        <div className="rules-card editable" onClick={openSettingsEditor}>
+        <div className={`rules-card ${amAdmin ? "editable" : ""}`} onClick={openSettingsEditor}>
           <RuleLine icon={Clock} text={`${settings.weekdayHours}h weekdays, ${settings.weekendHours}h weekends — due ${fmtDeadline(settings)}`} />
           <RuleLine icon={Flame} text="Miss a deadline → +1 point. Most points when it ends, loses." />
           <RuleLine icon={ThumbsUp} text={`Exemptions and timelapse proof require a ${settings.voteThreshold === "unanimous" ? "unanimous" : "majority"} group vote`} />
           <RuleLine icon={CalIcon} text={`Tracking since ${fmtDateLong(group.startDate)}`} />
-          <span className="tap-to-edit">Tap to edit — changes apply for everyone</span>
+          {amAdmin && <span className="tap-to-edit">Tap to edit — changes apply for everyone</span>}
         </div>
       ) : (
         <div className="sub-form">
@@ -1267,9 +1495,9 @@ function GroupTab({ group, me, persistGroup, showToast }) {
 
       <SectionTitle>Loser's forfeit</SectionTitle>
       {!editingForfeit ? (
-        <div className="forfeit-card" onClick={() => setEditingForfeit(true)}>
+        <div className={`forfeit-card ${amAdmin ? "" : "readonly"}`} onClick={() => amAdmin && setEditingForfeit(true)}>
           <Skull size={16} color="var(--c-red)" />
-          <span>{group.forfeit ? group.forfeit : "No forfeit set yet — tap to add one"}</span>
+          <span>{group.forfeit ? group.forfeit : amAdmin ? "No forfeit set yet — tap to add one" : "No forfeit set yet"}</span>
         </div>
       ) : (
         <div className="sub-form">
@@ -1318,10 +1546,13 @@ function totalPoints(group, memberId, startDate, today) {
    VOTES TAB
 ============================================================ */
 function VotesTab({ group, me, persistGroup, showToast }) {
+  const [view, setView] = useState("exemptions"); // "exemptions" | "timelapses"
   const others = group.members.length - 1;
   const voteThreshold = getSettings(group).voteThreshold;
   const exemptions = [...(group.exemptionRequests || [])].sort((a, b) => b.createdAt - a.createdAt);
   const timelapses = [...(group.timelapseVotes || [])].sort((a, b) => b.createdAt - a.createdAt);
+  const openExemptions = exemptions.filter(e => e.status === "open").length;
+  const openTimelapses = timelapses.filter(t => t.status === "open").length;
 
   async function castExemptionVote(reqId, vote) {
     await persistGroup(g => ({
@@ -1353,62 +1584,74 @@ function VotesTab({ group, me, persistGroup, showToast }) {
     showToast(vote === "yes" ? "Voted yes" : "Voted no");
   }
 
-  const hasAny = exemptions.length > 0 || timelapses.length > 0;
-
   return (
     <div className="tab-content">
-      {!hasAny && (
-        <EmptyState icon={ThumbsUp} text="No requests yet" sub="Exemption requests and timelapse submissions will show up here for the group to vote on." />
+      <div className="seg-control cal-view-toggle">
+        <button className={view === "exemptions" ? "active" : ""} onClick={() => setView("exemptions")}>
+          Exemptions{openExemptions > 0 ? ` (${openExemptions})` : ""}
+        </button>
+        <button className={view === "timelapses" ? "active" : ""} onClick={() => setView("timelapses")}>
+          Timelapses{openTimelapses > 0 ? ` (${openTimelapses})` : ""}
+        </button>
+      </div>
+
+      {view === "exemptions" ? (
+        exemptions.length === 0 ? (
+          <EmptyState icon={AlertCircle} text="No exemption requests yet" sub="When someone misses a deadline, they can request an exemption here for the group to vote on." />
+        ) : (
+          exemptions.map(req => {
+            const member = group.members.find(m => m.id === req.memberId);
+            const tally = tallyVotes(req.votes, others, voteThreshold);
+            const myVote = req.votes?.[me.id];
+            const isMine = req.memberId === me.id;
+            return (
+              <div key={req.id} className="vote-card">
+                <div className="vote-card-head">
+                  <span className="vote-card-who">{isMine ? "You" : member?.name}</span>
+                  <span className="vote-card-date">{fmtDateLong(req.date)}</span>
+                  <VoteStatusBadge status={req.status} />
+                </div>
+                <p className="vote-card-detail">
+                  {req.type === "full" ? "Requesting full-day exemption" : `Requesting ${req.partialHours}h excused`}
+                </p>
+                <p className="vote-card-reason">"{req.reason}"</p>
+                {req.status === "open" && !isMine && (
+                  <VoteButtons myVote={myVote} onVote={v => castExemptionVote(req.id, v)} />
+                )}
+                <VoteTally tally={tally} />
+              </div>
+            );
+          })
+        )
+      ) : (
+        timelapses.length === 0 ? (
+          <EmptyState icon={Video} text="No timelapses submitted yet" sub="Timelapse clips submitted for any logged activity will show up here for the group to vote on." />
+        ) : (
+          timelapses.map(tl => {
+            const member = group.members.find(m => m.id === tl.memberId);
+            const tally = tallyVotes(tl.votes, others, voteThreshold);
+            const myVote = tl.votes?.[me.id];
+            const isMine = tl.memberId === me.id;
+            return (
+              <div key={tl.id} className="vote-card">
+                <div className="vote-card-head">
+                  <span className="vote-card-who">{isMine ? "You" : member?.name}</span>
+                  <span className="vote-card-date">{fmtDateLong(tl.date)}</span>
+                  <VoteStatusBadge status={tl.status === "counted" ? "granted" : tl.status === "rejected" ? "denied" : "open"} />
+                </div>
+                {tl.activityLabel && <p className="vote-card-detail">For: {tl.activityLabel}</p>}
+                <a className="vote-card-link" href={tl.url} target="_blank" rel="noopener noreferrer">
+                  <Video size={13} /> Watch timelapse
+                </a>
+                {tl.status === "open" && !isMine && (
+                  <VoteButtons myVote={myVote} onVote={v => castTimelapseVote(tl.id, v)} label={["Counts as studying", "Doesn't count"]} />
+                )}
+                <VoteTally tally={tally} />
+              </div>
+            );
+          })
+        )
       )}
-
-      {exemptions.length > 0 && <SectionTitle>Exemption requests</SectionTitle>}
-      {exemptions.map(req => {
-        const member = group.members.find(m => m.id === req.memberId);
-        const tally = tallyVotes(req.votes, others, voteThreshold);
-        const myVote = req.votes?.[me.id];
-        const isMine = req.memberId === me.id;
-        return (
-          <div key={req.id} className="vote-card">
-            <div className="vote-card-head">
-              <span className="vote-card-who">{isMine ? "You" : member?.name}</span>
-              <span className="vote-card-date">{fmtDateLong(req.date)}</span>
-              <VoteStatusBadge status={req.status} />
-            </div>
-            <p className="vote-card-detail">
-              {req.type === "full" ? "Requesting full-day exemption" : `Requesting ${req.partialHours}h excused`}
-            </p>
-            <p className="vote-card-reason">"{req.reason}"</p>
-            {req.status === "open" && !isMine && (
-              <VoteButtons myVote={myVote} onVote={v => castExemptionVote(req.id, v)} />
-            )}
-            <VoteTally tally={tally} />
-          </div>
-        );
-      })}
-
-      {timelapses.length > 0 && <SectionTitle>Timelapse submissions</SectionTitle>}
-      {timelapses.map(tl => {
-        const member = group.members.find(m => m.id === tl.memberId);
-        const tally = tallyVotes(tl.votes, others, voteThreshold);
-        const myVote = tl.votes?.[me.id];
-        const isMine = tl.memberId === me.id;
-        return (
-          <div key={tl.id} className="vote-card">
-            <div className="vote-card-head">
-              <span className="vote-card-who">{isMine ? "You" : member?.name}</span>
-              <span className="vote-card-date">{fmtDateLong(tl.date)}</span>
-              <VoteStatusBadge status={tl.status === "counted" ? "granted" : tl.status === "rejected" ? "denied" : "open"} />
-            </div>
-            <a className="vote-card-link" href={tl.url} target="_blank" rel="noopener noreferrer">
-              <Video size={13} /> Watch timelapse
-            </a>
-            {tl.status === "open" && !isMine && (
-              <VoteButtons myVote={myVote} onVote={v => castTimelapseVote(tl.id, v)} label={["Counts as studying", "Doesn't count"]} />
-            )}
-            <VoteTally tally={tally} />
-          </div>
-        );
-      })}
     </div>
   );
 }
@@ -1608,6 +1851,12 @@ const CSS = `
 .onboard-hero h1 { font-family: var(--font-display); font-size: 26px; margin: 0; letter-spacing: -0.01em; }
 .onboard-hero p { color: var(--c-sage); font-size: 14px; margin: 0; max-width: 280px; }
 .onboard-rules { margin-top: 20px; display: flex; flex-direction: column; gap: 12px; background: var(--c-card); border: 1px solid var(--c-card-border); border-radius: 14px; padding: 16px; }
+
+.your-groups { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.your-group-row { display: flex; align-items: center; gap: 8px; background: var(--c-card); border: 1px solid var(--c-card-border); border-radius: 12px; padding: 6px 6px 6px 12px; }
+.your-group-main { flex: 1; display: flex; align-items: center; gap: 10px; background: transparent; border: none; cursor: pointer; padding: 6px 0; min-width: 0; }
+.your-group-name { font-size: 14px; font-weight: 700; color: var(--c-cream); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.your-group-as { font-size: 11.5px; color: var(--c-sage); margin-left: auto; flex-shrink: 0; }
 .rule-line { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; color: var(--c-cream); }
 .rule-line svg { flex-shrink: 0; margin-top: 1px; color: var(--c-amber); }
 .back-link { background: none; border: none; color: var(--c-sage); display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 0; font-size: 13px; align-self: flex-start; }
@@ -1711,6 +1960,15 @@ const CSS = `
 .muted-note { color: var(--c-sage); font-size: 13px; }
 .muted-note.small { font-size: 12px; }
 
+.activity-list { display: flex; flex-direction: column; gap: 1px; border-radius: 10px; overflow: hidden; background: rgba(255,255,255,0.03); }
+.activity-row { display: flex; align-items: center; gap: 8px; padding: 9px 11px; }
+.activity-row.total { background: rgba(255,255,255,0.04); font-weight: 700; }
+.activity-label { flex: 1; font-size: 13px; }
+.activity-row.total .activity-label { color: var(--c-sage); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+.activity-hours { font-family: var(--font-mono); font-size: 12.5px; color: var(--c-cream); }
+.icon-btn.small { padding: 2px; color: var(--c-sage); }
+.icon-btn.small:hover { color: var(--c-red); }
+
 .day-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .action-btn {
   background: transparent; border: 1px solid var(--c-card-border); color: var(--c-cream);
@@ -1726,8 +1984,12 @@ const CSS = `
 .seg-control button { flex: 1; background: transparent; border: none; color: var(--c-sage); padding: 8px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
 .seg-control button.active { background: var(--c-accent); color: #FFFFFF; }
 
+.timelapse-section { display: flex; flex-direction: column; gap: 12px; }
+.timelapse-activity-group { display: flex; flex-direction: column; gap: 6px; }
+.timelapse-activity-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 700; color: var(--c-sage); }
+.timelapse-activity-head .mini-btn { margin-left: auto; }
 .timelapse-list { display: flex; flex-direction: column; gap: 8px; }
-.timelapse-card { display: flex; gap: 8px; align-items: flex-start; background: rgba(255,255,255,0.03); padding: 10px; border-radius: 10px; }
+.timelapse-card { display: flex; gap: 8px; align-items: flex-start; background: rgba(255,255,255,0.03); padding: 10px; border-radius: 10px; margin-left: 21px; }
 .timelapse-card-body { display: flex; flex-direction: column; gap: 3px; }
 .timelapse-card-body a { color: var(--c-accent); font-size: 13px; font-weight: 600; text-decoration: none; }
 .tl-status { font-size: 11.5px; color: var(--c-sage); }
@@ -1740,15 +2002,19 @@ const CSS = `
 .invite-card { display: flex; align-items: center; gap: 10px; background: var(--c-card); border: 1px solid var(--c-card-border); border-radius: 14px; padding: 14px; font-size: 13px; color: var(--c-sage); }
 .member-list { display: flex; flex-direction: column; gap: 6px; }
 .member-row { display: flex; align-items: center; gap: 10px; background: var(--c-card); border: 1px solid var(--c-card-border); border-radius: 12px; padding: 10px 12px; }
+.member-row.admin-row { flex-wrap: wrap; }
 .member-avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--c-pending); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex-shrink: 0; }
-.member-name { flex: 1; font-size: 14px; font-weight: 600; }
+.member-name { flex: 1; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 7px; min-width: 0; }
 .member-points { font-family: var(--font-mono); font-size: 12px; color: var(--c-sage); }
+.admin-badge { font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; color: var(--c-accent); background: rgba(61,139,255,0.15); padding: 2px 7px; border-radius: 8px; flex-shrink: 0; }
 .rules-card { background: var(--c-card); border: 1px solid var(--c-card-border); border-radius: 14px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
 .rules-card.editable { cursor: pointer; }
 .rules-card.editable:hover { border-color: var(--c-accent); }
 .tap-to-edit { font-size: 11px; color: var(--c-accent); font-weight: 600; margin-top: 2px; }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .forfeit-card { display: flex; align-items: center; gap: 10px; background: var(--c-card); border: 1px solid var(--c-card-border); border-radius: 14px; padding: 14px; font-size: 13.5px; cursor: pointer; }
+.forfeit-card.readonly { cursor: default; }
+
 
 /* ---------- VOTES TAB ---------- */
 .empty-state { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 50px 20px; text-align: center; }
