@@ -142,8 +142,9 @@ function fmtDeadline(settings) {
    - "Shared" data (the group's state) lives in Supabase, in a single
      row per group code, so every friend's device reads/writes the
      same record. Realtime subscriptions push updates live.
-   - "Personal" data (just your own identity: name + which group you're
-     in) lives in localStorage, since that's specific to this device.
+   - "Memberships" (which groups you're in, and as whom) now live in
+     Supabase too, tied to your signed-in Google account — so the same
+     account sees the same groups on any device, not just one browser.
 ============================================================ */
 async function loadGroup(code) {
   try {
@@ -173,23 +174,56 @@ async function saveGroup(code, value) {
   }
 }
 
-function loadPersonal(key, fallback) {
+async function loadMemberships(userId) {
   try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
+    const { data, error } = await supabase
+      .from("memberships")
+      .select("*")
+      .eq("user_id", userId);
+    if (error) throw error;
+    return (data || []).map(row => ({
+      memberId: row.member_id,
+      name: row.display_name,
+      groupCode: row.group_code,
+      groupName: row.group_name,
+    }));
+  } catch (err) {
+    console.error("loadMemberships failed:", err);
+    return [];
   }
 }
-function savePersonal(key, value) {
+
+async function addMembershipRow(userId, membership) {
   try {
-    if (value === null || value === undefined) {
-      localStorage.removeItem(key);
-    } else {
-      localStorage.setItem(key, JSON.stringify(value));
-    }
+    const { error } = await supabase.from("memberships").upsert(
+      {
+        user_id: userId,
+        group_code: membership.groupCode,
+        member_id: membership.memberId,
+        group_name: membership.groupName,
+        display_name: membership.name,
+      },
+      { onConflict: "user_id,group_code" }
+    );
+    if (error) throw error;
     return true;
-  } catch {
+  } catch (err) {
+    console.error("addMembershipRow failed:", err);
+    return false;
+  }
+}
+
+async function removeMembershipRow(userId, groupCode) {
+  try {
+    const { error } = await supabase
+      .from("memberships")
+      .delete()
+      .eq("user_id", userId)
+      .eq("group_code", groupCode);
+    if (error) throw error;
+    return true;
+  } catch (err) {
+    console.error("removeMembershipRow failed:", err);
     return false;
   }
 }
@@ -296,6 +330,7 @@ const STATUS_STYLE = {
 ============================================================ */
 export default function App() {
   const [booting, setBooting] = useState(true);
+  const [user, setUser] = useState(null); // Supabase auth user, or null if signed out
   const [memberships, setMemberships] = useState([]); // [{memberId, name, groupCode, groupName}]
   const [activeCode, setActiveCode] = useState(null); // which group is currently open, or null = home screen
   const [group, setGroup] = useState(null);
@@ -310,13 +345,46 @@ export default function App() {
 
   const identity = activeCode ? memberships.find(m => m.groupCode === activeCode) : null;
 
-  // boot: load saved memberships from this device. Doesn't auto-open a
-  // group — the person picks one (or creates/joins a new one) from home.
+  // boot: check for an existing signed-in session, and keep listening for
+  // sign-in / sign-out events (e.g. after the Google redirect completes).
   useEffect(() => {
-    const saved = loadPersonal("memberships", []);
-    setMemberships(saved);
-    setBooting(false);
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user || null);
+      setBooting(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+    });
+    return () => listener.subscription.unsubscribe();
   }, []);
+
+  // once signed in, load this account's memberships from Supabase — this is
+  // what makes the same person see the same groups on any device they sign
+  // into with Google, instead of relying on per-device local storage.
+  useEffect(() => {
+    if (!user) {
+      setMemberships([]);
+      return;
+    }
+    (async () => {
+      const rows = await loadMemberships(user.id);
+      setMemberships(rows);
+    })();
+  }, [user?.id]);
+
+  async function handleSignIn() {
+    await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: window.location.origin },
+    });
+  }
+
+  async function handleSignOut() {
+    await supabase.auth.signOut();
+    setActiveCode(null);
+    setGroup(null);
+    setMemberships([]);
+  }
 
   // subscribe to live updates for the currently open group via Supabase
   // Realtime, so every friend's screen updates the moment anyone saves a
@@ -364,12 +432,10 @@ export default function App() {
     return next;
   }, [identity, group]);
 
-  function addMembership(newMembership) {
-    setMemberships(prev => {
-      const next = [...prev.filter(m => m.groupCode !== newMembership.groupCode), newMembership];
-      savePersonal("memberships", next);
-      return next;
-    });
+  async function addMembership(newMembership) {
+    if (!user) return;
+    setMemberships(prev => [...prev.filter(m => m.groupCode !== newMembership.groupCode), newMembership]);
+    await addMembershipRow(user.id, newMembership);
   }
 
   async function handleCreateGroup({ groupName, yourName, startDate, forfeit }) {
@@ -386,7 +452,7 @@ export default function App() {
       showToast("Couldn't create the group — check your connection and try again", "error");
       return;
     }
-    addMembership({ memberId, name: yourName, groupCode: code, groupName });
+    await addMembership({ memberId, name: yourName, groupCode: code, groupName });
     setGroup(newGroup);
     setActiveCode(code);
     setTab("calendar");
@@ -418,7 +484,7 @@ export default function App() {
       showToast("Couldn't join the group — check your connection and try again", "error");
       return false;
     }
-    addMembership({ memberId, name: yourName, groupCode: upperCode, groupName: existing.name });
+    await addMembership({ memberId, name: yourName, groupCode: upperCode, groupName: existing.name });
     setGroup(next);
     setActiveCode(upperCode);
     setTab("calendar");
@@ -432,20 +498,18 @@ export default function App() {
   }
 
   // Returning to home does NOT forget the group — it stays in "your groups"
-  // on the home screen so you can reopen it anytime with one tap.
+  // on the home screen so you can reopen it anytime with one tap, on any
+  // device you're signed into with the same Google account.
   function handleGoHome() {
     setActiveCode(null);
     setGroup(null);
   }
 
-  // Fully forgetting a group removes it from "your groups" on this device.
-  // Rejoining later would need the group code again.
-  function handleForgetGroup(groupCode) {
-    setMemberships(prev => {
-      const next = prev.filter(m => m.groupCode !== groupCode);
-      savePersonal("memberships", next);
-      return next;
-    });
+  // Fully forgetting a group removes it from "your groups" for this account
+  // (on every device, since it's stored against your Google sign-in now).
+  async function handleForgetGroup(groupCode) {
+    setMemberships(prev => prev.filter(m => m.groupCode !== groupCode));
+    if (user) await removeMembershipRow(user.id, groupCode);
     if (activeCode === groupCode) {
       setActiveCode(null);
       setGroup(null);
@@ -462,6 +526,14 @@ export default function App() {
     );
   }
 
+  if (!user) {
+    return (
+      <Shell>
+        <SignInScreen onSignIn={handleSignIn} />
+      </Shell>
+    );
+  }
+
   if (!identity || !group) {
     return (
       <Shell>
@@ -471,6 +543,8 @@ export default function App() {
           onForgetGroup={handleForgetGroup}
           onCreate={handleCreateGroup}
           onJoin={handleJoinGroup}
+          user={user}
+          onSignOut={handleSignOut}
         />
       </Shell>
     );
@@ -591,20 +665,78 @@ function Toast({ toast }) {
 /* ============================================================
    ONBOARDING
 ============================================================ */
-function Onboarding({ memberships, onOpenGroup, onForgetGroup, onCreate, onJoin }) {
+/* ============================================================
+   SIGN IN SCREEN — shown before anything else. Real auth is just
+   Google OAuth via Supabase; once signed in, the same account sees
+   the same groups on any device.
+============================================================ */
+function SignInScreen({ onSignIn }) {
+  return (
+    <div className="onboard">
+      <div className="onboard-hero">
+        <Flame size={36} color="var(--c-amber)" />
+        <h1>Summer Study Pact</h1>
+        <p>Log your hours. Keep the streak alive. Last place owes a forfeit.</p>
+      </div>
+      <button className="primary-btn google-btn" onClick={onSignIn}>
+        <GoogleIcon size={18} /> Continue with Google
+      </button>
+      <p className="muted-note small" style={{ textAlign: "center" }}>
+        Sign in once and your groups follow you to any phone or computer.
+      </p>
+    </div>
+  );
+}
+
+function GoogleIcon({ size = 18 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48">
+      <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.4 29.3 35 24 35c-6.1 0-11-4.9-11-11s4.9-11 11-11c2.8 0 5.3 1 7.3 2.7l5.7-5.7C33.7 6.5 29.1 4.5 24 4.5 12.7 4.5 3.5 13.7 3.5 25S12.7 45.5 24 45.5 44.5 36.3 44.5 25c0-1.6-.2-3.1-.9-4.5z"/>
+      <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 16 19 13 24 13c2.8 0 5.3 1 7.3 2.7l5.7-5.7C33.7 6.5 29.1 4.5 24 4.5c-7.6 0-14.1 4.3-17.7 10.2z"/>
+      <path fill="#4CAF50" d="M24 45.5c5 0 9.6-1.9 13-5.1l-6-5.1C29.2 36.7 26.7 37.5 24 37.5c-5.3 0-9.7-3.4-11.3-8.1l-6.6 5.1C9.6 41.1 16.2 45.5 24 45.5z"/>
+      <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.2-4.2 5.6l6 5.1C40.9 35.8 44.5 31 44.5 25c0-1.6-.2-3.1-.9-4.5z"/>
+    </svg>
+  );
+}
+
+function Onboarding({ memberships, onOpenGroup, onForgetGroup, onCreate, onJoin, user, onSignOut }) {
   const [mode, setMode] = useState("landing");
   const [groupName, setGroupName] = useState("");
-  const [yourName, setYourName] = useState("");
+  const defaultName = (user?.user_metadata?.full_name || user?.user_metadata?.name || "").split(" ")[0] || "";
+  const [yourName, setYourName] = useState(defaultName);
   const [startDate, setStartDate] = useState(dateStrToday());
   const [forfeit, setForfeit] = useState("");
   const [joinCode, setJoinCode] = useState("");
-  const [joinName, setJoinName] = useState("");
+  const [joinName, setJoinName] = useState(defaultName);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+
+  const accountLabel = user?.user_metadata?.full_name || user?.email || "your account";
+  const avatarUrl = user?.user_metadata?.avatar_url;
 
   if (mode === "landing") {
     return (
       <div className="onboard">
+        <div className="account-row">
+          {avatarUrl ? (
+            <img src={avatarUrl} alt="" className="account-avatar" />
+          ) : (
+            <span className="member-avatar tiny">{accountLabel.slice(0, 1).toUpperCase()}</span>
+          )}
+          <span className="account-label">{accountLabel}</span>
+          {!confirmSignOut ? (
+            <button className="icon-btn" onClick={() => setConfirmSignOut(true)} title="Sign out">
+              <LogOut size={16} />
+            </button>
+          ) : (
+            <div className="leave-confirm">
+              <button className="mini-btn danger" onClick={onSignOut}>Sign out</button>
+              <button className="mini-btn" onClick={() => setConfirmSignOut(false)}>No</button>
+            </div>
+          )}
+        </div>
+
         <div className="onboard-hero">
           <Flame size={36} color="var(--c-amber)" />
           <h1>Summer Study Pact</h1>
@@ -1260,6 +1392,11 @@ function ExemptionRequestForm({ date, me, group, persistGroup, showToast, onDone
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const existingForDay = (group.exemptionRequests || []).filter(
+    e => e.memberId === me.id && e.date === date
+  );
+  const openExisting = existingForDay.find(e => e.status === "open");
+
   async function submit() {
     if (date === dateStrToday()) {
       showToast("Exemptions must be requested by the day before", "error");
@@ -1286,8 +1423,23 @@ function ExemptionRequestForm({ date, me, group, persistGroup, showToast, onDone
     onDone();
   }
 
+  if (openExisting) {
+    return (
+      <div className="sub-form">
+        <p className="muted-note small">
+          You already have an open request for this day ({openExisting.type === "full" ? "full day" : `${openExisting.partialHours}h`}) —
+          check the Votes tab to see how voting is going. You can submit another once that one's resolved.
+        </p>
+        <button className="secondary-btn" onClick={onDone}>Close</button>
+      </div>
+    );
+  }
+
   return (
     <div className="sub-form">
+      {existingForDay.some(e => e.status === "denied") && (
+        <p className="muted-note small">A previous request for this day was denied — you can try again with more detail.</p>
+      )}
       <div className="seg-control">
         <button className={type === "full" ? "active" : ""} onClick={() => setType("full")}>Full day</button>
         <button className={type === "partial" ? "active" : ""} onClick={() => setType("partial")}>Partial</button>
@@ -1300,9 +1452,12 @@ function ExemptionRequestForm({ date, me, group, persistGroup, showToast, onDone
       <Field label="Reason for the group">
         <textarea rows={2} value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Family thing all day, traveling, sick..." />
       </Field>
-      <button className="primary-btn" onClick={submit} disabled={busy}>
-        {busy ? <Loader2 size={15} className="spin" /> : <ThumbsUp size={15} />} Send to group vote
-      </button>
+      <div className="form-row-btns">
+        <button className="primary-btn" onClick={submit} disabled={busy}>
+          {busy ? <Loader2 size={15} className="spin" /> : <ThumbsUp size={15} />} Send to group vote
+        </button>
+        <button className="secondary-btn" onClick={onDone}>Cancel</button>
+      </div>
     </div>
   );
 }
@@ -1857,6 +2012,12 @@ const CSS = `
 
 /* ---------- ONBOARDING ---------- */
 .onboard { padding: 28px 22px; display: flex; flex-direction: column; gap: 14px; height: 100%; }
+
+.account-row { display: flex; align-items: center; gap: 8px; padding: 4px 0 0; }
+.account-avatar { width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0; object-fit: cover; }
+.account-label { font-size: 12.5px; color: var(--c-sage); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.google-btn { background: #FFFFFF; color: #1F1F1F; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.google-btn:hover { background: #F5F5F5; }
 .onboard-hero { text-align: center; padding: 30px 0 10px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
 .onboard-hero h1 { font-family: var(--font-display); font-size: 26px; margin: 0; letter-spacing: -0.01em; }
 .onboard-hero p { color: var(--c-sage); font-size: 14px; margin: 0; max-width: 280px; }
